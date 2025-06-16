@@ -6,12 +6,18 @@ pub enum Device {
     None,
     TtyPath(String),
     Gpsd(String),
+    /// PPS from non-GNSS source
+    Pps,
 }
 
 impl Device {
     pub fn new(path: &str) -> Device {
         if path.is_empty() {
             return Device::None;
+        }
+
+        if path == "PPS" {
+            return Device::Pps;
         }
 
         if let Some(host) = path.strip_prefix("gpsd://") {
@@ -41,6 +47,7 @@ impl Serialize for Device {
             Device::None => "".to_string(),
             Device::TtyPath(v) => v.to_string(),
             Device::Gpsd(v) => format!("gpsd://{}", v),
+            Device::Pps => "PPS".to_string(),
         })
     }
 }

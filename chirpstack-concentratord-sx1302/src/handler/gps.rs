@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::mpsc::Receiver;
 use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -48,18 +49,19 @@ pub fn set_static_gps_coords(lat: f64, lon: f64, alt: i16) {
 pub fn gps_loop(gps_device: gnss::Device, stop_receive: Receiver<Signal>) -> Result<()> {
     debug!("Starting GPS loop");
 
-    let mut gps_reader: Box<dyn BufRead> = match gps_device {
+    let mut gps_reader: Option<Box<dyn BufRead>> = match gps_device {
         gnss::Device::TtyPath(tty_path) => {
             info!("Enabling GPS device, tty_path: {}", tty_path);
             let gps_file = gps::enable(&tty_path, gps::GPSFamily::UBX7, 0)?;
-            Box::new(BufReader::new(gps_file)) as Box<dyn BufRead>
+            Some(Box::new(BufReader::new(gps_file)) as Box<dyn BufRead>)
         }
         gnss::Device::Gpsd(gpsd_host) => {
-            info!("Starting gpsd reader, server: localhost:2947");
-            Box::new(gpsd::get_reader(&gpsd_host)?) as Box<dyn BufRead>
+            info!("Starting gpsd reader, server: {}", gpsd_host);
+            Some(Box::new(gpsd::get_reader(&gpsd_host)?) as Box<dyn BufRead>)
         }
+        gnss::Device::Pps => None,
         gnss::Device::None => {
-            warn!("No GPS device configured");
+            warn!("No PPS device configured");
             return Ok(());
         }
     };
@@ -70,69 +72,75 @@ pub fn gps_loop(gps_device: gnss::Device, stop_receive: Receiver<Signal>) -> Res
             return Ok(());
         }
 
-        let mut buffer = vec![0; 1];
-        gps_reader
-            .read_exact(&mut buffer)
-            .context("Read from GPS")?;
+        if let Some(gps_reader) = &mut gps_reader {
+            let mut buffer = vec![0; 1];
+            gps_reader
+                .read_exact(&mut buffer)
+                .context("Read from GPS")?;
 
-        match buffer[0] {
-            // ubx
-            0xb5 => {
-                // We need to read 5 additional bytes for the header + PL length.
-                buffer.resize(6, 0);
-                gps_reader
-                    .read_exact(&mut buffer[1..])
-                    .context("Read from GPS")?;
+            match buffer[0] {
+                // ubx
+                0xb5 => {
+                    // We need to read 5 additional bytes for the header + PL length.
+                    buffer.resize(6, 0);
+                    gps_reader
+                        .read_exact(&mut buffer[1..])
+                        .context("Read from GPS")?;
 
-                // Parse PL length and read additional payload.
-                let len: usize = u16::from_le_bytes([buffer[4], buffer[5]]).into();
-                buffer.resize(6 + len + 2, 0);
-                gps_reader
-                    .read_exact(&mut buffer[6..])
-                    .context("Read from GPS")?;
+                    // Parse PL length and read additional payload.
+                    let len: usize = u16::from_le_bytes([buffer[4], buffer[5]]).into();
+                    buffer.resize(6 + len + 2, 0);
+                    gps_reader
+                        .read_exact(&mut buffer[6..])
+                        .context("Read from GPS")?;
 
-                // Ignore messages other than "B5620120"
-                if !buffer[0..4].eq(&[0xb5, 0x62, 0x01, 0x20]) {
-                    continue;
-                }
-
-                match gps::parse_ubx(&buffer) {
-                    Ok((m_type, _)) => {
-                        if m_type == gps::MessageType::UBX_NAV_TIMEGPS {
-                            debug!("Processing u-blox NAV-TIMEGPS");
-                            gps_process_sync();
-                        }
-                    }
-                    Err(err) => {
-                        error!("Parse ubx error, error: {}", err);
+                    // Ignore messages other than "B5620120"
+                    if !buffer[0..4].eq(&[0xb5, 0x62, 0x01, 0x20]) {
                         continue;
                     }
-                };
-            }
-            // nmea
-            0x24 => {
-                gps_reader
-                    .read_until(b'\n', &mut buffer)
-                    .context("Read from GPS")?;
 
-                match gps::parse_nmea(&buffer[..buffer.len() - 1]) {
-                    Ok(m_type) => {
-                        if m_type == gps::MessageType::NMEA_RMC {
-                            debug!("Processing NMEA RMC");
-                            gps_process_coords();
+                    match gps::parse_ubx(&buffer) {
+                        Ok((m_type, _)) => {
+                            if m_type == gps::MessageType::UBX_NAV_TIMEGPS {
+                                debug!("Processing u-blox NAV-TIMEGPS");
+                                gps_process_sync(false);
+                            }
+                        }
+                        Err(err) => {
+                            error!("Parse ubx error, error: {}", err);
+                            continue;
+                        }
+                    };
+                }
+                // nmea
+                0x24 => {
+                    gps_reader
+                        .read_until(b'\n', &mut buffer)
+                        .context("Read from GPS")?;
+
+                    match gps::parse_nmea(&buffer[..buffer.len() - 1]) {
+                        Ok(m_type) => {
+                            if m_type == gps::MessageType::NMEA_RMC {
+                                debug!("Processing NMEA RMC");
+                                gps_process_coords();
+                            }
+                        }
+                        Err(err) => {
+                            error!("Parse nmea string error, error: {}", err);
+                            continue;
                         }
                     }
-                    Err(err) => {
-                        error!("Parse nmea string error, error: {}", err);
-                        continue;
-                    }
+                }
+                _ => {
+                    // No error logging here. When an unknown ubx message header is
+                    // received, we first need to find the next nmea or ubx
+                    // identifier.
                 }
             }
-            _ => {
-                // No error logging here. When an unknown ubx message header is
-                // received, we first need to find the next nmea or ubx
-                // identifier.
-            }
+        } else {
+            /* Nothing special to do for raw PPS */
+            thread::sleep(Duration::from_secs(1));
+            gps_process_sync(true);
         }
     }
 }
@@ -277,13 +285,23 @@ pub fn get_gps_epoch() -> Result<Duration> {
     Ok(GPS_TIME_REF.lock().unwrap().gps_epoch)
 }
 
-fn gps_process_sync() {
-    let (gps_time, gps_epoch, _, _) = match gps::get(true, false) {
-        Ok(v) => v,
-        Err(err) => {
-            debug!("Get gps time failed, error: {}", err);
-            return;
+fn gps_process_sync(spoof: bool) {
+    let (gps_time, gps_epoch) = if !spoof {
+        match gps::get(true, false) {
+            Ok((gps_time, gps_epoch, _, _)) => (gps_time, gps_epoch),
+            Err(err) => {
+                debug!("Get gps time failed, error: {}", err);
+                return;
+            }
         }
+    } else {
+        let mut sys_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("SystemTime out of range");
+        /* Get top of second */
+        sys_epoch -= Duration::from_nanos(sys_epoch.subsec_nanos() as u64);
+        let sys_time = SystemTime::UNIX_EPOCH + sys_epoch;
+        (sys_time, sys_epoch)
     };
 
     let trig_cnt = match hal::get_trigcnt() {

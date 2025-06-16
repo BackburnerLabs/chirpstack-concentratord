@@ -504,9 +504,21 @@ pub fn new(conf: &config::Configuration) -> Result<Configuration> {
         _ => return Err(anyhow!("Region not supported: {}", region)),
     };
 
-    let gps = conf.gateway.model_flags.contains(&"GNSS".to_string());
+    /* Serial-attached GNSS receiver */
+    let gnss = conf.gateway.model_flags.contains(&"GNSS".to_string());
+    /* GNSS receiver controlled via GPSd */
+    let gpsd = conf.gateway.model_flags.contains(&"GPSD".to_string());
+    /* Raw PPS signal with no associated GNSS */
+    let pps = conf.gateway.model_flags.contains(&"PPS".to_string());
+    /* Device is connected via USB */
     let usb = conf.gateway.model_flags.contains(&"USB".to_string());
     let enforce_duty_cycle = conf.gateway.model_flags.contains(&"ENFORCE_DC".to_string());
+
+    if (gnss && gpsd) || (gnss && pps) || (gpsd && pps) {
+        return Err(anyhow!(
+            "GNSS, GPSD, and PPS model flags are mutually-exclusive"
+        ));
+    }
 
     Ok(Configuration {
         enforce_duty_cycle,
@@ -548,11 +560,15 @@ pub fn new(conf: &config::Configuration) -> Result<Configuration> {
                 tx_gain_table: vec![],
             },
         ],
-        gps: match gps {
-            true => conf
-                .gateway
-                .get_gnss_dev_path(&gnss::Device::new("/dev/ttyAMA0")),
-            false => gnss::Device::None,
+        gps: if (gnss) {
+            conf.gateway
+                .get_gnss_dev_path(&gnss::Device::new("/dev/ttyAMA0"))
+        } else if gpsd {
+            gnss::Device::Gpsd("localhost:2947".to_string())
+        } else if pps {
+            gnss::Device::Pps
+        } else {
+            gnss::Device::None
         },
         com_type: match usb {
             true => ComType::Usb,

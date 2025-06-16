@@ -57,11 +57,11 @@ pub fn gps_loop(gps_device: gnss::Device, stop_receive: Receiver<Signal>) -> Res
             Box::new(BufReader::new(gps_file)) as Box<dyn BufRead>
         }
         gnss::Device::Gpsd(gpsd_host) => {
-            info!("Starting gpsd reader, server: localhost:2947");
+            info!("Starting gpsd reader, server: {}", gpsd_host);
             Box::new(gpsd::get_reader(&gpsd_host).expect("could not open gpsd reader"))
                 as Box<dyn BufRead>
         }
-        gnss::Device::None => {
+        _ => {
             warn!("No GPS device configured");
             return Ok(());
         }
