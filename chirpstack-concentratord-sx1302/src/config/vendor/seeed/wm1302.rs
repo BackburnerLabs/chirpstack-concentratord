@@ -1,5 +1,5 @@
 use anyhow::Result;
-use libconcentratord::region;
+use libconcentratord::{gnss, region};
 use libloragw_sx1302::hal;
 
 use super::super::super::super::config::{self, Region};
@@ -168,8 +168,21 @@ pub fn new(conf: &config::Configuration) -> Result<Configuration> {
         _ => return Err(anyhow!("Region not supported: {}", region)),
     };
 
+    /* Serial-attached GNSS receiver */
+    let gnss = conf.gateway.model_flags.contains(&"GNSS".to_string());
+    /* GNSS receiver controlled via GPSd */
+    let gpsd = conf.gateway.model_flags.contains(&"GPSD".to_string());
+    /* Raw PPS signal with no associated GNSS */
+    let pps = conf.gateway.model_flags.contains(&"PPS".to_string());
+    /* Device is connected via USB */
     let usb = conf.gateway.model_flags.contains(&"USB".to_string());
     let enforce_duty_cycle = conf.gateway.model_flags.contains(&"ENFORCE_DC".to_string());
+
+    if (gnss && gpsd) || (gnss && pps) || (gpsd && pps) {
+        return Err(anyhow!(
+            "GNSS, GPSD, and PPS model flags are mutually-exclusive"
+        ));
+    }
 
     Ok(Configuration {
         enforce_duty_cycle,
@@ -224,6 +237,16 @@ pub fn new(conf: &config::Configuration) -> Result<Configuration> {
         sx1302_reset_pin: conf.gateway.get_sx1302_reset_pin("/dev/gpiochip0", 17),
         sx1302_power_en_pin: conf.gateway.get_sx1302_power_en_pin("/dev/gpiochip0", 18),
         sx1261_reset_pin: conf.gateway.get_sx1261_reset_pin("/dev/gpiochip0", 5),
+        gps: if gnss {
+            conf.gateway
+                .get_gnss_dev_path(&gnss::Device::new("/dev/ttyAMA0"))
+        } else if gpsd {
+            gnss::Device::Gpsd("localhost:2947".to_string())
+        } else if pps {
+            gnss::Device::Pps
+        } else {
+            gnss::Device::None
+        },
         ..Default::default()
     })
 }
